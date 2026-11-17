@@ -1,55 +1,60 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
+#include <dht11.h>
 
-const char* ssid = "Wifi";       // Nome Wifi
-const char* password = "Password";       // Password Wifi
-const char* mqtt_server = "192.168.137.1";       // IP Hotspot PC (Docker)
-const char* token = "Access_Token";        // Access Token di ThingsBoard
+const char* ssid = "WiFi";       
+const char* password = "Password";       
+const char* mqtt_server = "MQTT_server_IP";       
+const char* token = "Access_Token";        
 
+#define DHT11PIN 17        // Pin sensore DHT11
+#define MotorPin1 19       // Pin (IN+) per ventola 
+#define MotorPin2 18       // Pin (IN-) per ventola
 
-#define DHTPIN 17          // Pin sensore DHT11
-#define DHTTYPE DHT11
-#define FAN_PIN 18        // Pin ventola
-
-DHT dht(DHTPIN, DHTTYPE);
+dht11 DHT11;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
 unsigned long lastMsg = 0;
 
-// Gestione comandi per la ventola (se ThingsBoard invia effettivamente i comandi e su quale canale MQTT arrivano)
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Comando RPC ricevuto [");
-  Serial.print(topic);
-  Serial.print("]: ");
+double dewPointFast(double celsius, double humidity)
+{
+        double a = 17.271;
+        double b = 237.7;
+        double temp = (a * celsius) / (b + celsius) + log(humidity/100);
+        double Td = (b * temp) / (a - temp);
+        return Td;
+}
 
+void callback(char* topic, byte* payload, unsigned int length) {
   String message = "";
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
+  Serial.print("Comando RPC ricevuto: ");
   Serial.println(message);
 
-  // Controllo per attivare o disattivare la ventola
   if (message.indexOf("on") != -1 || message.indexOf("true") != -1 || message.indexOf("1") != -1) {
-    Serial.println("-> Attivazione ventilatore...");
-    digitalWrite(FAN_PIN, HIGH); // Accende la ventola
+    Serial.println("-> Attivazione ventola...");
+    // Rotazione sinistra con potenza = 70
+    ledcWrite(1, 70); 
+    ledcWrite(3, 0);
   } 
   else if (message.indexOf("off") != -1 || message.indexOf("false") != -1 || message.indexOf("0") != -1) {
-    Serial.println("-> Spegnimento ventilatore...");
-    digitalWrite(FAN_PIN, LOW);  // Spegne la ventola
+    Serial.println("-> Spegnimento ventola...");
+    // Stop
+    ledcWrite(1, 0);
+    ledcWrite(3, 0);
   }
 }
 
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Connessione a ThingsBoard... ");
-    if (client.connect("ESP32_SmartGreenhouse", token, NULL)) {
+    if (client.connect("ESP32_SmartFarm", token, NULL)) {
       Serial.println("CONNESSO!");
-      client.subscribe("v1/devices/me/rpc/request/+"); // Ascolta i comandi RPC
-      Serial.println("Iscritto ai comandi RPC.");
+      client.subscribe("v1/devices/me/rpc/request/+");
     } else {
       Serial.print("FALLITO, rc=");
       Serial.print(client.state());
@@ -62,15 +67,17 @@ void reconnect() {
 void setup() {
   Serial.begin(9600);
   delay(1000);
-  Serial.println("\n--- AVVIO GREENHOUSE KEYESTUDIO ---");
 
-  // Inizializzazione sensore DHT11
-  pinMode(DHTPIN, INPUT_PULLUP);
-  dht.begin();
-
-  // Inizializzazione ventola
-  pinMode(FAN_PIN, OUTPUT);
-  digitalWrite(FAN_PIN, LOW); // inizialmente spenta
+  // Configurazione PWM per il motore
+  pinMode(MotorPin1, OUTPUT);
+  pinMode(MotorPin2, OUTPUT);
+  ledcSetup(1, 1200, 8);        // Imposta frequenza LEDC Channel 1 a 1200Hz, PWM risoluzione a 8 bit, quindi velocità del motore regolata su 256 livelli, da 0 (fermo) a 255 (massima velocità)
+  ledcAttachPin(MotorPin1, 1);  // Collega fisicamente LEDC Channel 1 appena configurato al pin gpio19
+  ledcSetup(3, 1200, 8);        // Stessa cosa per pin 18
+  ledcAttachPin(MotorPin2, 3);
+  
+  ledcWrite(1, 0);
+  ledcWrite(3, 0);
 
   // Connessione Wi-Fi
   WiFi.mode(WIFI_STA);
@@ -80,14 +87,11 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWi-Fi Connesso!");
-  Serial.print("IP ESP32: ");
-  Serial.println(WiFi.localIP());
 
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
 }
 
-// Invio dati ogni 5 secondi
 void loop() {
   if (!client.connected()) {
     reconnect();
@@ -98,11 +102,19 @@ void loop() {
   if (now - lastMsg > 5000) {
     lastMsg = now;
 
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
+    // Lettura dal sensore DHT11
+    int chk = DHT11.read(DHT11PIN);
 
-    if (!isnan(t) && !isnan(h)) {
-      String payload = "{\"temperature\":" + String(t, 1) + ",\"humidity\":" + String(h, 1) + "}";
+    if (chk == DHTLIB_OK) { // Lettura andata a buon fine
+      float t = (float)DHT11.temperature;
+      float h = (float)DHT11.humidity;
+
+      float dp = dewPointFast(t, h); // Punto di rugiada
+
+      // Costruzione del payload JSON
+      String payload = "{\"temperature\":" + String(t, 1) + 
+                        ", \"humidity\":" + String(h, 1) + 
+                        ", \"dewPoint\":" + String(dp, 2) + "}";
       Serial.print("Inviato: ");
       Serial.println(payload);
       client.publish("v1/devices/me/telemetry", payload.c_str());
